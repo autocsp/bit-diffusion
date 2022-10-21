@@ -1,9 +1,4 @@
 from bit_diffusion import Unet, Transformer, Trainer, BitDiffusion
-import torch
-from torch import nn
-
-
-
 
 # model = Unet(
 #     dim = 32,
@@ -13,16 +8,17 @@ from torch import nn
 
 model = Transformer(
     dim = 32,
-    channels = 1
-).cuda()
+    channels = 1,
+    layers = 3,
+)#.cuda()
 
 bit_diffusion = BitDiffusion(
     model,
-    image_size = 10,
+    image_size = 9,
     timesteps = 100,
     time_difference = 0.1,       # they found in the paper that at lower number of timesteps, a time difference during sampling of greater than 0 helps FID. as timesteps increases, this time difference can be set to 0 as it does not help
     use_ddim = True              # use ddim
-).cuda()
+)#.cuda()
 
 trainer = Trainer(
     bit_diffusion,
@@ -33,7 +29,7 @@ trainer = Trainer(
     gradient_accumulate_every = 4,    # gradient accumulation
     train_lr = 1e-4,                  # learning rate
     save_and_sample_every = 5000,     # how often to save and sample
-    train_num_steps = 250000,          # total training steps
+    train_num_steps = 250001,          # total training steps
     ema_decay = 0.995,                # exponential moving average decay
 )
 

@@ -249,6 +249,7 @@ class Transformer(nn.Module):
         self,
         dim,
         channels=3,
+        layers=1,
         bits=BITS,
         learned_sinusoidal_dim=16,
     ):
@@ -277,14 +278,20 @@ class Transformer(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
 
+        self.layers = nn.ModuleList([TransformerBlock(embed_dim=channels) for _ in range(layers)])
+        self.final_mlp = nn.Linear(2*channels, channels)
 
-        self.block = TransformerBlock(embed_dim=channels)
 
-    def forward(self, x, time, x_self_cond=None):
+    def forward(self, x, time=None, x_self_cond=None):
         x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
         x = torch.cat((x_self_cond, x), dim=1)
 
-        self.block(x)
+        for l in self.layers:
+            x = l(x)
+
+        x_f = rearrange(x, "b d w h -> b w h d")
+        x_f = self.final_mlp(x_f)
+        x = rearrange(x_f, "b w h d -> b d w h")
 
         return x
 
@@ -306,7 +313,7 @@ class TransformerBlock(nn.Module):
         # m = self.mlp
         # self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time=None, x_self_cond = None):
         orig_shape = x.shape
         x = x.reshape((orig_shape[0], -1, self.embed_dim))
         inp = self.norm1(x)
@@ -484,7 +491,7 @@ def domain_to_bits(x, domain=DOMAIN, bits=BITS):
     device = x.device
     x = x.int().clamp(0, domain)
 
-    mask = 2 ** torch.arange(bits - 1, -1, -1, device=device)
+    mask = 2 ** torch.arange(bits - 1, -1, -1, device=device, dtype=torch.int32)
     mask = rearrange(mask, "d -> d 1 1")
     x = rearrange(x, "b c h w -> b c 1 h w")
 
@@ -732,19 +739,68 @@ class BitDiffusion(nn.Module):
         self_cond = None
         if random() < 0.5:
             with torch.no_grad():
-                self_cond = self.model(noised_img, noise_level).detach_()
+                self_cond = self.model(noised_img, noise_level).detach()
 
         # predict and take gradient step
 
-        pred = self.model(noised_img, noise_level, self_cond)
+        # pred = self.model(noised_img, noise_level, self_cond)
 
-        # Calc loss only on relevant part of the "image"
-        constraint_loss = violation_loss(pred[0:9, 0:9], sudoku_reward)
-        return F.mse_loss(pred[0:9, 0:9], img[0:9, 0:9]) + constraint_loss
-        # return F.mse_loss(pred, img)
+        pred, action, logprob, entropy, _ = self.get_action_and_value((noised_img, noise_level, self_cond))
+
+        mse_loss = F.mse_loss(pred, img)
+        reward = sudoku_reward(action)
+        # constraint_loss = violation_loss(pred, sudoku_reward)
+        constraint_loss = violation_loss_cell(pred, sudoku_reward_per_cell)
+        # return  + constraint_loss
+
+        # Should the instance be a single-step episode? 
+        # Or a multi-step without time dependencies? In the latter, what are the states
+
+        # action must allow to calculate logprob again on updated network
+        # current approach has no sampling in the action selection
+
+        # get_action_and_value (multi step)
+        # return action, logprob, probs.entropy(), critic value
+
+        # get_action_and_value (single step)
+        # return action vector, logprob.sum(0), entropy.sum(0), critic value
+
+        # mse loss (for base training), obs (noised_img? img?), action (pred), logprob (?),  
+        return mse_loss, noised_img, action, logprob, entropy, reward
+
+    def get_action_and_value(self, x, action=None):
+        noised_img, noise_level, self_cond = x  # make consistent with other code 
+        pred = self.model(noised_img, noise_level, self_cond)
+        probs = pred_to_probs(pred)
+
+        if action is None:
+            action, mask = sample_actions(pred)
+        else:
+            mask = domain_to_bits(action) > 0
+
+        logprobs = torch.log(probs * mask + (1 - probs) * ~mask)
+        entropy = -(probs * logprobs)  # From categorical distribution, not sure if correct
+
+        # logprob/entropy is either for the joint action (sum all cells) or per cell (.sum(1))
+        return pred, action, logprobs.sum(1), entropy.sum(1), None  # no critic yet
 
 
 # extra loss function
+
+def pred_to_probs(x):
+    eps = torch.finfo(x.dtype).eps
+    probs = torch.clamp((x + 1) / 2, min=eps, max=1 - eps)
+    return probs
+
+
+def sample_actions(probs):
+    # mask candidate because it might exceed the domain boundary
+    mask_cand = torch.randn_like(probs) > probs
+    # conversion takes care of the bounds by clamping
+    pred_d = bits_to_domain(mask_cand)
+    mask = domain_to_bits(pred_d) > 0
+
+    return pred_d, mask
 
 
 def violation_loss(pred, violation_fn):
@@ -754,13 +810,13 @@ def violation_loss(pred, violation_fn):
     x_binary = (pred > 0).int()
     mask = x_binary == 1
 
-    eps = torch.finfo(pred.dtype).eps
-    probs = torch.clamp((pred + 1) / 2, min=eps, max=1 - eps)
+    probs = pred_to_probs(pred)
     logprobs = torch.log(probs * mask + (1 - probs) * ~mask)
     summed_logprobs = reduce(logprobs, "b c w h -> b", "sum")
 
     loss = (-summed_logprobs * v).mean()
     return loss
+
 
 @torch.no_grad()
 def sudoku_reward(x):
@@ -797,6 +853,58 @@ def sudoku_violations(x):
     return v
 
 
+
+def violation_loss_cell(pred, violation_fn):
+    pred_d = bits_to_domain(pred)
+    v = violation_fn(pred_d)
+
+    x_binary = (pred > 0).int()
+    mask = x_binary == 1
+
+    eps = torch.finfo(pred.dtype).eps
+    probs = torch.clamp((pred + 1) / 2, min=eps, max=1 - eps)
+    logprobs = -torch.log(probs * mask + (1 - probs) * ~mask) * v
+    loss = reduce(logprobs, "b c w h -> b", "mean").mean()
+
+    return loss
+
+
+@torch.no_grad()
+def sudoku_reward_per_cell(x):
+    batch = x.shape[0]
+    size = x.shape[2]
+    max_violations = 3 * (size - 1)
+
+    rewards = torch.zeros_like(x)
+
+    for b in range(batch):
+        rewards[b, 0] = torch.tensor(sudoku_violations_cell(x[b, 0]), device=x.device)
+
+    return 1-rewards/max_violations
+
+def sudoku_violations_cell(x):
+    assert len(x.shape) == 2
+    size = x.shape[1]
+    block_size = int(math.sqrt(size))
+
+    v = np.zeros_like(x)
+
+    for c in range(size):
+        v[:, c] += size - torch.unique(x[:, c]).shape[0]
+
+    for r in range(size):
+        v[r, :] += size - torch.unique(x[r, :]).shape[0]
+
+    for r in range(0, size, block_size):
+        for c in range(0, size, block_size):
+            r_end = r + block_size
+            c_end = c + block_size
+            v[r : r_end, c: c_end] += size - torch.unique(x[r : r_end, c : c_end]).shape[0]
+
+    return v
+
+
+
 # dataset classes
 
 
@@ -818,7 +926,7 @@ class SudokuDataset(Dataset):
     ):
         super().__init__()
         self.instance_file = instance_file
-        self.instances = np.load(instance_file)
+        self.instances = np.load(instance_file) #[:50]
 
         self.transform = T.Compose(
             [
@@ -832,11 +940,11 @@ class SudokuDataset(Dataset):
 
     def __getitem__(self, index):
         inst = torch.from_numpy(self.instances[index])
-        # return inst
+        return self.transform(inst).unsqueeze(0)
         # Pad to have an even width/height for UNet
-        padded_inst = torch.zeros(size=(1, 10, 10))
-        padded_inst[0, 0:9, 0:9] = self.transform(inst)
-        return padded_inst
+        # padded_inst = torch.zeros(size=(1, 10, 10))
+        # padded_inst[0, 0:9, 0:9] = self.transform(inst)
+        # return padded_inst
 
 
 # trainer class
@@ -905,7 +1013,7 @@ class Trainer(object):
         self.dl = cycle(dl)
 
         # optimizer
-
+        # PPO: eps=1e-5, pytorch default: eps=1e-8
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr, betas=adam_betas)
 
         # for logging results in a folder periodically
@@ -968,18 +1076,21 @@ class Trainer(object):
             while self.step < self.train_num_steps:
 
                 total_loss = 0.0
+                total_reward = 0.0
+                
 
                 for _ in range(self.gradient_accumulate_every):
                     data = next(self.dl).to(device)
 
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        loss, action, obs, logprob, entropy, reward = self.model(data)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
+                        total_reward += reward.mean() / self.gradient_accumulate_every
 
                     self.accelerator.backward(loss)
 
-                pbar.set_description(f"loss: {total_loss:.4f}")
+                pbar.set_description(f"l: {total_loss:.4f} | r: {total_reward:.2f}")
 
                 accelerator.wait_for_everyone()
 
