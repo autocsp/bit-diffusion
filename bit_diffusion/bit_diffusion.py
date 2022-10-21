@@ -748,9 +748,9 @@ class BitDiffusion(nn.Module):
         pred, action, logprob, entropy, _ = self.get_action_and_value((noised_img, noise_level, self_cond))
 
         mse_loss = F.mse_loss(pred, img)
-        reward = sudoku_reward(action)
+        reward = sudoku_reward(action.cpu())
         # constraint_loss = violation_loss(pred, sudoku_reward)
-        constraint_loss = violation_loss_cell(pred, sudoku_reward_per_cell)
+        #constraint_loss = violation_loss_cell(pred, sudoku_reward_per_cell)
         # return  + constraint_loss
 
         # Should the instance be a single-step episode? 
